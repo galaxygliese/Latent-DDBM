@@ -6,6 +6,7 @@ import torch
 from torch import nn
 from tqdm.auto import trange
 from typing import Union, List
+from functools import partial
 from .model import SongUNet
 
 def append_dims(x, target_dims):
@@ -67,6 +68,10 @@ class Denoiser(nn.Module):
         c_skip, c_out, c_in = [append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
         return self.inner_model(input * c_in, sigma, **kwargs) * c_out + input * c_skip
     
+def rand_log_normal(shape, loc=0., scale=1., device='cuda', dtype=torch.float32):
+    """Draws samples from an lognormal distribution."""
+    return (torch.randn(shape, device=device, dtype=dtype) * scale + loc).exp()    
+
 class DdbmEdmDenoiser(nn.Module):
     def __init__(
         self,
@@ -76,9 +81,11 @@ class DdbmEdmDenoiser(nn.Module):
         sigma_max: float = 80,
         rho: int = 7,
         c: float = 1,
+        num_sampling_steps:int=40,
         cov_xy: float = 0.0,
         device: Union[int, str] = 'cuda',
         ):
+        super().__init__()
         # NN model
         self.unet = unet
         
@@ -87,6 +94,9 @@ class DdbmEdmDenoiser(nn.Module):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.rho = rho
+        self.num_sampling_steps = num_sampling_steps
+        self.sigma_sample_density_mean = -1.2
+        self.sigma_sample_density_std = 1.2
         
         # Scaling factor parameters
         self.c = c 
@@ -101,6 +111,22 @@ class DdbmEdmDenoiser(nn.Module):
         max_inv_rho = self.sigma_max ** (1 / self.rho)
         sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** self.rho
         return append_zero(sigmas).to(self.device)
+    
+    def sample_sigmas_uniform(self, x:torch.Tensor):
+        """ Uniform schedule sampler """
+        ramp = torch.randint(1, self.num_sampling_steps, (x.shape[0],), device=x.device) / (self.num_sampling_steps - 1)
+        min_inv_rho = self.sigma_min ** (1 / self.rho)
+        max_inv_rho = self.sigma_max ** (1 / self.rho)
+        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** self.rho
+        return sigmas
+    
+    def sample_sigmas(self, x:torch.Tensor):
+        """ Schedule sampler """        
+        B = x.shape[0]
+        sample_density = partial(rand_log_normal, loc=self.sigma_sample_density_mean, scale=self.sigma_sample_density_std)
+        sigmas = sample_density([B], device=self.device)
+        sigmas = torch.minimum(sigmas, torch.ones_like(sigmas)* self.sigma_max)
+        return sigmas
     
     def get_snrs(self, sigmas:torch.Tensor):
         # sigmas : (B, )
@@ -120,17 +146,19 @@ class DdbmEdmDenoiser(nn.Module):
         c_in, c_skip, c_out = [
             append_dims(x_t, x_t.ndim) for x in self.get_ddbm_scalings(sigmas)
         ]
-        c_noises = 1000 * sigmas.log() / 4
+        # c_noises = 1000 * sigmas.log() / 4
+        c_noises = sigmas.log() / 4
         F = self.unet(c_in * x_t, c_noises, **model_kwargs)
         D = x_t * c_skip + c_out * F
         return D
     
-    def get_ddbm_sample(self, x_0: torch.Tensor, x_T:torch.Tensor, n:torch.Tensor, sigmas:torch.Tensor):
+    def get_ddbm_sample(self, x_0: torch.Tensor, x_T:torch.Tensor, noise:torch.Tensor, sigmas:torch.Tensor):
+        sigmas = append_dims(sigmas, x_0.ndim)
         a_t = sigmas**2 / self.sigma_max**2
         b_t = (1 - sigmas**2 / self.sigma_max**2)
         mu_t = a_t * x_T + b_t * x_0 
         std_t = sigmas * torch.sqrt(b_t)
-        return mu_t + std_t * n
+        return mu_t + std_t * noise
     
     def get_loss_weightings(self, sigmas:torch.Tensor):
         a_t = sigmas**2 / self.sigma_max**2
@@ -140,12 +168,42 @@ class DdbmEdmDenoiser(nn.Module):
         weights = c_buff / ((a_t)**2 * (self.sigma_data**4 - self.cov_xy**2) + self.sigma_data**2 * self.c * b_t * sigmas**2)
         return weights
     
-    def get_loss(self, x_start:torch.Tensor, x_T:torch.Tensor, sigmas:torch.Tensor, model_kwargs=None):
+    def get_loss(self, x_start:torch.Tensor, x_T:torch.Tensor, model_kwargs=None):
         noise = torch.randn_like(x_start)
-        x_t = self.get_ddbm_sample(x_start, x_T, sigmas, n=noise)
+        sigmas = self.sample_sigmas(x_start)
+        x_t = self.get_ddbm_sample(x_0=x_start, x_T=x_T, noise=noise, sigmas=sigmas)
         D = self.get_denoised(x_t, sigmas)
-        lamgdas = self.get_loss_weightings(sigmas)
+        
+        lambdas = self.get_loss_weightings(sigmas)
         lambdas = append_dims(lambdas, x_start.ndim)
-        loss = mean_flat((D - x_start)**2)
+        loss = mean_flat(lambdas*(D - x_start)**2)
         return loss
+    
+    def get_dxdt(self, x_t:torch.Tensor, sigma_t:torch.Tensor, denoised_t:torch.Tensor, x_T:torch.Tensor):
+        s = (denoised_t - x_t) / append_dims(sigma_t**2, x_t.ndim)
+        h = (x_T - x_t) / (append_dims(torch.ones_like(sigma_t)*self.sigma_max**2, x_t.ndim) - append_dims(sigma_t**2, x_t.ndim))
+        dxdt = -0.5 * (2*sigma_t)*s
+        return dxdt
+    
+    @torch.no_grad()
+    def sample(self, y:torch.Tensor, steps:int, guidance:float=1) -> torch.Tensor:
+        """ DDBM Heun Sampler """
+        sigmas = self.get_sigmas(steps)
+        x_T = y
+        x = y
+        indices = range(len(sigmas) - 1)
+        for i, index in enumerate(indices):
+            sigma_t = sigmas[index].unsqueeze(0)
+            D = self.get_denoised(x, sigma_t)
+            dxdt = self.get_dxdt(x, sigma_t, D, x_T)
+            dt = sigmas[index + 1].unsqueeze(0) - sigma_t
+            if sigmas[index + 1] == 0:
+                x = x + dxdt * dt
+            else:
+                x_heun = x + dxdt * dt 
+                sigma_heun = sigmas[index + 1].unsqueeze(0)
+                D_heun = self.get_denoised(x_heun, sigma_heun)
+                dxdt_heun = self.get_dxdt(x_heun, sigma_heun, D_heun, x_T)
+                x = x + (dxdt + dxdt_heun) / 2 * dt
+        return x
         

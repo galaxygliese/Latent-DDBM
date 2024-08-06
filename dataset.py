@@ -64,7 +64,8 @@ class FolderPairDataset(Dataset):
                 T.Resize(image_size),
                 T.CenterCrop(image_size),
                 T.ToTensor(),
-                T.Lambda(lambda t: (t * 2) - 1),
+                # T.Lambda(lambda t: (t * 2) - 1),
+                T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
             ])
         else:
             self.transform = transform
@@ -81,7 +82,7 @@ class FolderPairDataset(Dataset):
         condition = img.crop((w//2, 0, w, h))
         target_tensor = self.transform(target)
         cond_tensor = self.transform(condition)
-        return [target_tensor, cond_tensor]
+        return target_tensor, cond_tensor
 
 if __name__ == '__main__':
     from torchvision.utils import make_grid, save_image

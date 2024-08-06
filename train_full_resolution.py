@@ -30,14 +30,14 @@ parser.add_argument('--export_folder', type=str, default="./checkpoints")
 parser.add_argument('--warmup_steps', type=int, default=50)
 parser.add_argument('--num_channels', type=int, default=64)
 parser.add_argument('--num_res_blocks', type=int, default=1)
-parser.add_argument('--save-per-epoch', type=int, default=5)
+parser.add_argument('--save-per-epoch', type=int, default=50)
 parser.add_argument('-d', '--device', type=int, default=0)
 
 # Dataset options
 parser.add_argument('--dataset_path', type=str)
 parser.add_argument('--image_size', type=int, default=256)
-parser.add_argument('--in_channels', type=int, default=4)
-parser.add_argument('--out_channels', type=int, default=4)
+parser.add_argument('--in_channels', type=int, default=3)
+parser.add_argument('--out_channels', type=int, default=3)
 
 # Karras (EDM) options
 parser.add_argument('--sigma_data', type=float, default=0.5)
@@ -53,15 +53,7 @@ parser.add_argument('--resume_checkpoint', type=str)
 parser.add_argument('--resume_epochs', type=int, default=0)
 opt = parser.parse_args()
 
-LATENT_DIM = opt.image_size // 8
-
-def encode_img(img:torch.Tensor):
-    z = vae.encode(img).latent_dist.sample().detach() # z : (B, 4, 32, 32)
-    return z 
-
-def decode_img(z:torch.Tensor):
-    x = vae.decode(z).sample 
-    return x 
+# LATENT_DIM = opt.image_size // 8
 
 def rand_log_normal(shape, loc=0., scale=1., device='cuda', dtype=torch.float32):
     """Draws samples from an lognormal distribution."""
@@ -73,16 +65,16 @@ def generate(
         y: torch.Tensor,
         num_diffusion_iters:int, 
         export_name:str, 
-        sample_num:int, 
+        # sample_num:int, 
         device:str='cuda'
     ):
-    B = sample_num
+    # B = sample_num
     with torch.no_grad():
         # initialize action from Guassian noise
-        nlatent = model.sample(y, steps=num_diffusion_iters)
+        nimage = model.sample(y, steps=num_diffusion_iters)
         
-        nimage = decode_img(nlatent)
         imgs = nimage.detach().to('cpu')
+        imgs = 0.5*(imgs+1)
         
         img = make_grid(imgs)
         img = transforms.functional.to_pil_image(img)
@@ -102,12 +94,10 @@ def train():
                     # data normalized in dataset
                     # device transfer
                     x, y = nbatch[0].to(device), nbatch[1].to(device)
-                    latent_x = encode_img(x)
-                    latent_y = encode_img(y)
-                    B = latent_x.shape[0]
+                    B = x.shape[0]
                     
                     # sample a diffusion iteration for each data point
-                    loss = model.get_loss(x_start=latent_x, x_T=latent_y).mean()
+                    loss = model.get_loss(x_start=x, x_T=y).mean()
 
                     # optimize
                     loss.backward()
@@ -130,10 +120,10 @@ def train():
                     model.eval()
                     generate(
                         model=model,
-                        y=test_latent_y,
+                        y=test_y,
                         num_diffusion_iters=num_diffusion_iters,
                         export_name=f"{opt.export_folder}/epoch{epoch_idx+1}.png",
-                        sample_num=4
+                        # sample_num=4
                     )
 
 if __name__ == '__main__':
@@ -168,7 +158,7 @@ if __name__ == '__main__':
 
     num_diffusion_iters = opt.diffusion_timesteps    
     unet = create_model(
-        image_size=LATENT_DIM,
+        image_size=opt.image_size,
         num_channels=opt.num_channels,
         num_res_blocks=opt.num_res_blocks,
         in_channels=opt.in_channels,
@@ -187,20 +177,13 @@ if __name__ == '__main__':
         state_dict = torch.load(opt.resume_checkpoint, map_location='cuda')
         model.load_state_dict(state_dict)
         print("Pretrained Model Loaded")
-        
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
-    vae.eval()
-    for param in vae.parameters():
-        param.requires_grad = False
-    print("VAE Loaded!")
-    
+            
     batch = next(iter(dataloader))
     print("batch.shape:", batch[0].shape, batch[1].shape)
     print("batch x range:", torch.max(batch[0]), torch.min(batch[0]))
     print("batch y range:", torch.max(batch[1]), torch.min(batch[1]))
     test_x, test_y = batch[0], batch[1]
-    test_latent_y = encode_img(test_y.to(device))
-    print("batch latent y range:", torch.max(test_latent_y), torch.min(test_latent_y))
+    test_y = test_y.to(device)
     
     optimizer = torch.optim.AdamW(
         params=model.parameters(), 
