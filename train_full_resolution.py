@@ -75,6 +75,7 @@ def generate(
         
         imgs = nimage.detach().to('cpu')
         imgs = 0.5*(imgs+1)
+        imgs = (imgs*255).clip(0, 255)
         
         img = make_grid(imgs)
         img = transforms.functional.to_pil_image(img)

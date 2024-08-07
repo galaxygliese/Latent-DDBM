@@ -3,6 +3,7 @@
 
 import math
 import torch
+import numpy as np
 from torch import nn
 from tqdm.auto import trange
 from typing import Union, List
@@ -84,6 +85,12 @@ def vp_logsnr(sigmas:torch.Tensor, beta_d, beta_min):
 def vp_logs(sigmas:torch.Tensor, beta_d, beta_min):
     sigmas = torch.as_tensor(sigmas)
     return -0.25 * sigmas ** 2 * (beta_d) - 0.5 * sigmas * beta_min
+
+def vp_snr_sqrt_reciprocal(sigmas:torch.Tensor, beta_d, beta_min):
+    return (np.e ** (0.5 * beta_d * (sigmas ** 2) + beta_min * sigmas) - 1) ** 0.5
+
+def vp_snr_sqrt_reciprocal_deriv(sigmas:torch.Tensor, beta_d, beta_min):
+    return 0.5 * (beta_min + beta_d * sigmas) * (vp_snr_sqrt_reciprocal(sigmas, beta_d, beta_min) + 1 / vp_snr_sqrt_reciprocal(sigmas, beta_d, beta_min))
 
 class DdbmEdmDenoiser(nn.Module):
     def __init__(
@@ -252,22 +259,59 @@ class DdbmEdmDenoiser(nn.Module):
         noise = torch.randn_like(x_start)
         sigmas = self.sample_sigmas(x_start)
         x_t = self.get_ddbm_sample(x_0=x_start, x_T=x_T, noise=noise, sigmas=sigmas)
-        # print("noise:", torch.max(noise))
-        # print("x_T:", torch.max(x_t))
         D = self.get_denoised(x_t, sigmas)
-        # print("D:", torch.max(D))
         
         lambdas = self.get_loss_weightings(sigmas)
-        # print("lambdas:", torch.max(lambdas))
         lambdas = append_dims(lambdas, x_start.ndim)
         loss = mean_flat(lambdas*(D - x_start)**2)
         return loss
     
-    def get_dxdt(self, x_t:torch.Tensor, sigma_t:torch.Tensor, denoised_t:torch.Tensor, x_T:torch.Tensor):
-        s = (denoised_t - x_t) / append_dims(sigma_t**2, x_t.ndim)
-        h = (x_T - x_t) / (append_dims(torch.ones_like(sigma_t)*self.sigma_max**2, x_t.ndim) - append_dims(sigma_t**2, x_t.ndim))
-        dxdt = -0.5 * (2*sigma_t)*s
-        return dxdt
+    def get_dxdt(self, x_t:torch.Tensor, sigma_t:torch.Tensor, denoised_t:torch.Tensor, x_T:torch.Tensor, stochastic:bool=True, w:float=1):
+        if self.sde_type == SDEType.VE:
+            s = (denoised_t - x_t) / append_dims(sigma_t**2, x_t.ndim)
+            h = (x_T - x_t) / (append_dims(torch.ones_like(sigma_t)*self.sigma_max**2, x_t.ndim) - append_dims(sigma_t**2, x_t.ndim))
+            dxdt = -0.5 * (2*sigma_t)*s
+            return dxdt
+        elif self.sde_type == SDEType.VP:
+            """Converts a denoiser output to a Karras ODE derivative."""
+            a_t = self.get_condition_weight(sigma_t)
+            b_t = self.get_sample_weight(sigma_t)
+            mu_t = a_t * x_T + b_t * denoised_t 
+            # std_t = (-torch.expm1(logsnr_T - logsnr_t)).sqrt() * (logs_t - logsnr_t/2).exp()
+            
+            
+            # x, denoised, x_T, std(sigmas[i]),logsnr(sigmas[i]), logsnr_T, logs(sigmas[i] ), logs_T, s_deriv(sigmas[i] ), vp_snr_sqrt_reciprocal(sigmas[i] ), vp_snr_sqrt_reciprocal_deriv(sigmas[i] )
+            # x, denoised, x_T, std_t,logsnr_t, logsnr_T, logs_t, logs_T, s_t_deriv, sigma_t, sigma_t_deriv
+            s = (1 + vp_snr_sqrt_reciprocal(sigma_t, self.beta_d, self.beta_min) ** 2).rsqrt()
+            std_t = vp_snr_sqrt_reciprocal(sigma_t, self.beta_d, self.beta_min) * s
+            s_t_deriv = -vp_snr_sqrt_reciprocal(sigma_t, self.beta_d, self.beta_min) * vp_snr_sqrt_reciprocal_deriv(sigma_t, self.beta_d, self.beta_min) * (s ** 3)
+            sigma_t_deriv = vp_snr_sqrt_reciprocal_deriv(sigma_t, self.beta_d, self.beta_min)
+            sigma_t_hat = vp_snr_sqrt_reciprocal(sigma_t, self.beta_d, self.beta_min)
+            
+            logsnr_t = vp_logsnr(sigma_t, self.beta_d, self.beta_min)
+            logsnr_T = vp_logsnr(self.sigma_max, self.beta_d, self.beta_min)
+            logs_t = vp_logs(sigma_t, self.beta_d, self.beta_min)
+            logs_T = vp_logs(1, self.beta_d, self.beta_min)
+            # logs = lambda t: -0.25 * t ** 2 * (self.beta_d) - 0.5 * t * self.beta_min
+            # logsnr = lambda t :  - 2 * torch.log(vp_snr_sqrt_reciprocal(t, self.beta_d, self.beta_min))
+            # logsnr_T = logsnr(torch.as_tensor(self.sigma_max))
+            # logs_T = logs(torch.as_tensor(self.sigma_max))
+            # logsnr_t = logsnr(torch.as_tensor(sigma_t))
+            # logs_t = logs(torch.as_tensor(sigma_t))
+            
+            grad_logq = - (x_t - mu_t)/std_t**2 / (-torch.expm1(logsnr_T - logsnr_t))
+            grad_logpxTlxt = -(x_t - torch.exp(logs_t-logs_T)*x_T) /std_t**2  / torch.expm1(logsnr_t - logsnr_T)
+            f = s_t_deriv * (-logs_t).exp() * x_t
+            gt2 = 2 * (logs_t).exp()**2 * sigma_t_hat * sigma_t_deriv 
+            
+            dxdt = f -  gt2 * ((0.5 if not stochastic else 1)* grad_logq - w * grad_logpxTlxt)
+            # grad_pxtlx0 = (denoised_t - x_t) / append_dims(sigma_t**2, x_t.ndim)
+            # grad_pxTlxt = (x_T - x_t) / (append_dims(torch.ones_like(sigma_t)*self.sigma_max**2, x_t.ndim) - append_dims(sigma_t**2, x_t.ndim))
+            # gt2 = 2*sigma_t
+            # dxdt = - (0.5 if not stochastic else 1) * gt2 * (grad_pxtlx0 - w * grad_pxTlxt * (0 if stochastic else 1))
+            return dxdt 
+        else:
+            raise NotImplementedError
     
     @torch.no_grad()
     def sample(self, y:torch.Tensor, steps:int, guidance:float=1) -> torch.Tensor:
@@ -278,7 +322,7 @@ class DdbmEdmDenoiser(nn.Module):
         indices = range(len(sigmas) - 1)
         for i, index in enumerate(indices):
             sigma_t = sigmas[index].unsqueeze(0)
-            D = self.get_denoised(x, sigma_t)
+            D = self.get_denoised(x, sigma_t).clamp(-1, 1)
             dxdt = self.get_dxdt(x, sigma_t, D, x_T)
             dt = sigmas[index + 1].unsqueeze(0) - sigma_t
             if sigmas[index + 1] == 0:
@@ -286,7 +330,7 @@ class DdbmEdmDenoiser(nn.Module):
             else:
                 x_heun = x + dxdt * dt 
                 sigma_heun = sigmas[index + 1].unsqueeze(0)
-                D_heun = self.get_denoised(x_heun, sigma_heun)
+                D_heun = self.get_denoised(x_heun, sigma_heun).clamp(-1, 1)
                 dxdt_heun = self.get_dxdt(x_heun, sigma_heun, D_heun, x_T)
                 x = x + (dxdt + dxdt_heun) / 2 * dt
         return x
