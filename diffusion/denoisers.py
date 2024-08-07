@@ -7,7 +7,12 @@ from torch import nn
 from tqdm.auto import trange
 from typing import Union, List
 from functools import partial
+from enum import Enum
 from .model import SongUNet
+
+class SDEType(Enum):
+    VP = "VP"
+    VE = "VE"
 
 def append_dims(x, target_dims):
     """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
@@ -72,6 +77,14 @@ def rand_log_normal(shape, loc=0., scale=1., device='cuda', dtype=torch.float32)
     """Draws samples from an lognormal distribution."""
     return (torch.randn(shape, device=device, dtype=dtype) * scale + loc).exp()    
 
+def vp_logsnr(sigmas:torch.Tensor, beta_d, beta_min):
+    sigmas = torch.as_tensor(sigmas)
+    return - torch.log((0.5 * beta_d * (sigmas ** 2) + beta_min * sigmas).exp() - 1)
+    
+def vp_logs(sigmas:torch.Tensor, beta_d, beta_min):
+    sigmas = torch.as_tensor(sigmas)
+    return -0.25 * sigmas ** 2 * (beta_d) - 0.5 * sigmas * beta_min
+
 class DdbmEdmDenoiser(nn.Module):
     def __init__(
         self,
@@ -84,6 +97,7 @@ class DdbmEdmDenoiser(nn.Module):
         num_sampling_steps:int=40,
         cov_xy: float = 0.0,
         device: Union[int, str] = 'cuda',
+        sde_type: SDEType = SDEType.VP,
         ):
         super().__init__()
         # NN model
@@ -91,6 +105,7 @@ class DdbmEdmDenoiser(nn.Module):
         
         # Scheduler parameters
         self.sigma_data = sigma_data
+        self.sigma_data_end = sigma_data
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.rho = rho
@@ -101,8 +116,11 @@ class DdbmEdmDenoiser(nn.Module):
         # Scaling factor parameters
         self.c = c 
         self.cov_xy = cov_xy
+        self.beta_d = 2
+        self.beta_min = 0.1
         
         self.device = device
+        self.sde_type = sde_type
         
     def get_sigmas(self, n:int):
         """Constructs the noise schedule of Karras et al. (2022)."""
@@ -130,51 +148,117 @@ class DdbmEdmDenoiser(nn.Module):
     
     def get_snrs(self, sigmas:torch.Tensor):
         # sigmas : (B, )
-        return sigmas ** -2
+        if self.sde_type == SDEType.VE:
+            return sigmas ** -2
+        elif self.sde_type == SDEType.VP:
+            return vp_logsnr(sigmas, self.beta_d, self.beta_min).exp()
+        else:
+            raise NotImplementedError
+        
+    def get_condition_weight(self, sigmas:torch.Tensor): # = a_t
+        if self.sde_type == SDEType.VE:
+            return sigmas**2 / self.sigma_max**2
+        elif self.sde_type == SDEType.VP:
+            logsnr_t = vp_logsnr(sigmas, self.beta_d, self.beta_min)
+            logsnr_T = vp_logsnr(self.sigma_max, self.beta_d, self.beta_min)
+            logs_t = vp_logs(sigmas, self.beta_d, self.beta_min)
+            logs_T = vp_logs(1, self.beta_d, self.beta_min)
+            return (logsnr_T - logsnr_t + logs_t - logs_T).exp()
+        else:
+            raise NotImplementedError
+    
+    def get_sample_weight(self, sigmas:torch.Tensor): # = b_t
+        if self.sde_type == SDEType.VE:
+            return 1 - sigmas**2 / self.sigma_max**2
+        elif self.sde_type == SDEType.VP:
+            logsnr_t = vp_logsnr(sigmas, self.beta_d, self.beta_min)
+            logsnr_T = vp_logsnr(self.sigma_max, self.beta_d, self.beta_min)
+            logs_t = vp_logs(sigmas, self.beta_d, self.beta_min)
+            return - torch.expm1(logsnr_T - logsnr_t) * logs_t.exp()
+        else:
+            raise NotImplementedError
     
     def get_ddbm_scalings(self, sigma:torch.Tensor):
-        a_t = sigma**2 / self.sigma_max**2
-        b_t = (1 - sigma**2 / self.sigma_max**2)
-        c_buff = a_t**2 * self.sigma_data**2 + b_t**2 * (self.sigma_data**2 + self.c*sigma**2) \
-                + 2 * a_t * b_t * self.cov_xy 
-        c_in = 1 / (c_buff ** 0.5)
-        c_skip = (b_t * self.sigma_data**2 + a_t*self.cov_xy) / c_buff 
-        c_out = ((a_t**2) * (self.sigma_data**4 - self.cov_xy**2) + self.sigma_data**2 * self.c**2 * b_t * sigma**2)**0.5 * c_in
-        return c_in, c_skip, c_out
+        a_t = self.get_condition_weight(sigma)
+        b_t = self.get_sample_weight(sigma)
+        if self.sde_type == SDEType.VE:
+            c_buff = a_t**2 * self.sigma_data**2 + b_t**2 * (self.sigma_data**2 + self.c*sigma**2) \
+                    + 2 * a_t * b_t * self.cov_xy 
+            c_in = 1 / (c_buff ** 0.5)
+            c_skip = (b_t * self.sigma_data**2 + a_t*self.cov_xy) / c_buff 
+            c_out = ((a_t**2) * (self.sigma_data**4 - self.cov_xy**2) + self.sigma_data**2 * self.c**2 * b_t * sigma**2)**0.5 * c_in
+            return c_in, c_skip, c_out
+        elif self.sde_type == SDEType.VP:
+            logsnr_t = vp_logsnr(sigma, self.beta_d, self.beta_min)
+            logsnr_T = vp_logsnr(1, self.beta_d, self.beta_min)
+            logs_t = vp_logs(sigma, self.beta_d, self.beta_min)
+            c_t = -torch.expm1(logsnr_T - logsnr_t) * (2*logs_t - logsnr_t).exp()
+            A = a_t**2 * self.sigma_data_end**2 + b_t**2 * self.sigma_data**2 + 2*a_t * b_t * self.cov_xy + self.c**2 * c_t
+            
+            c_in = 1 / (A) ** 0.5
+            c_skip = (b_t * self.sigma_data**2 + a_t * self.cov_xy)/ A
+            c_out = (a_t**2 * (self.sigma_data_end**2 * self.sigma_data**2 - self.cov_xy**2) + self.sigma_data**2 *  self.c **2 * c_t )**0.5 * c_in
+            return c_in, c_skip, c_out
+        else:
+            raise NotImplementedError
     
     def get_denoised(self, x_t:torch.Tensor, sigmas:torch.Tensor, **model_kwargs):
         c_in, c_skip, c_out = [
             append_dims(x_t, x_t.ndim) for x in self.get_ddbm_scalings(sigmas)
         ]
-        # c_noises = 1000 * sigmas.log() / 4
-        c_noises = sigmas.log() / 4
+        c_noises = 1000 * sigmas.log() / 4
+        # c_noises = sigmas.log() / 4
         F = self.unet(c_in * x_t, c_noises, **model_kwargs)
         D = x_t * c_skip + c_out * F
         return D
-    
+        
     def get_ddbm_sample(self, x_0: torch.Tensor, x_T:torch.Tensor, noise:torch.Tensor, sigmas:torch.Tensor):
         sigmas = append_dims(sigmas, x_0.ndim)
-        a_t = sigmas**2 / self.sigma_max**2
-        b_t = (1 - sigmas**2 / self.sigma_max**2)
+        a_t = self.get_condition_weight(sigmas)
+        b_t = self.get_sample_weight(sigmas)
         mu_t = a_t * x_T + b_t * x_0 
-        std_t = sigmas * torch.sqrt(b_t)
-        return mu_t + std_t * noise
+        if self.sde_type == SDEType.VE:
+            std_t = sigmas * torch.sqrt(b_t)
+        elif self.sde_type == SDEType.VP:
+            logsnr_t = vp_logsnr(sigmas, self.beta_d, self.beta_min)
+            logsnr_T = vp_logsnr(self.sigma_max, self.beta_d, self.beta_min)
+            logs_t = vp_logs(sigmas, self.beta_d, self.beta_min)
+            std_t = (-torch.expm1(logsnr_T - logsnr_t)).sqrt() * (logs_t - logsnr_t/2).exp()
+        else:
+            raise NotImplementedError
+        x_t = mu_t + std_t * noise
+        return torch.clamp(x_t, min=-self.sigma_max, max=self.sigma_max)
     
     def get_loss_weightings(self, sigmas:torch.Tensor):
-        a_t = sigmas**2 / self.sigma_max**2
-        b_t = (1 - sigmas**2 / self.sigma_max**2)
-        c_buff = a_t**2 * self.sigma_data**2 + b_t**2 * (self.sigma_data**2 + self.c*sigmas**2) \
-                + 2 * a_t * b_t * self.cov_xy 
-        weights = c_buff / ((a_t)**2 * (self.sigma_data**4 - self.cov_xy**2) + self.sigma_data**2 * self.c * b_t * sigmas**2)
-        return weights
+        a_t = self.get_condition_weight(sigmas)
+        b_t = self.get_sample_weight(sigmas)
+        if self.sde_type == SDEType.VE:
+            c_buff = a_t**2 * self.sigma_data**2 + b_t**2 * (self.sigma_data**2 + self.c*sigmas**2) \
+                    + 2 * a_t * b_t * self.cov_xy 
+            weights = c_buff / ((a_t)**2 * (self.sigma_data**4 - self.cov_xy**2) + self.sigma_data**2 * self.c * b_t * sigmas**2)
+            return weights
+        elif self.sde_type == SDEType.VP:
+            logsnr_t = vp_logsnr(sigmas, self.beta_d, self.beta_min)
+            logsnr_T = vp_logsnr(1, self.beta_d, self.beta_min)
+            logs_t = vp_logs(sigmas, self.beta_d, self.beta_min)
+            c_t = -torch.expm1(logsnr_T - logsnr_t) * (2*logs_t - logsnr_t).exp()
+            A = a_t**2 * self.sigma_data_end**2 + b_t**2 * self.sigma_data**2 + 2*a_t * b_t * self.cov_xy + self.c**2 * c_t
+            weights = A / (a_t**2 * (self.sigma_data_end**2 * self.sigma_data**2 - self.cov_xy**2) + self.sigma_data**2 * self.c**2 * c_t )
+            return weights
+        else:
+            raise NotImplementedError
     
     def get_loss(self, x_start:torch.Tensor, x_T:torch.Tensor, model_kwargs=None):
         noise = torch.randn_like(x_start)
         sigmas = self.sample_sigmas(x_start)
         x_t = self.get_ddbm_sample(x_0=x_start, x_T=x_T, noise=noise, sigmas=sigmas)
+        # print("noise:", torch.max(noise))
+        # print("x_T:", torch.max(x_t))
         D = self.get_denoised(x_t, sigmas)
+        # print("D:", torch.max(D))
         
         lambdas = self.get_loss_weightings(sigmas)
+        # print("lambdas:", torch.max(lambdas))
         lambdas = append_dims(lambdas, x_start.ndim)
         loss = mean_flat(lambdas*(D - x_start)**2)
         return loss

@@ -17,10 +17,7 @@ import torch
 parser = argparse.ArgumentParser()
 
 # General options
-parser.add_argument('-e', '--epochs', type=int, default=100)
-parser.add_argument('-b', '--batchsize', type=int, default=8)
 parser.add_argument('--diffusion_timesteps', type=int, default=40) # Different from training
-parser.add_argument('--ema_power', type=float, default=0.75)
 parser.add_argument('--lr', type=float, default=1e-4)
 parser.add_argument('--warmup_steps', type=int, default=50)
 parser.add_argument('--num_channels', type=int, default=64)
@@ -37,8 +34,8 @@ parser.add_argument('--out_channels', type=int, default=3)
 parser.add_argument('--sigma_data', type=float, default=0.5)
 parser.add_argument('--sigma_sample_density_mean', type=float, default=-1.2)
 parser.add_argument('--sigma_sample_density_std', type=float, default=1.2)
-parser.add_argument('--sigma_max', type=float, default=80)
-parser.add_argument('--sigma_min', type=float, default=0.0002)
+parser.add_argument('--sigma_max', type=float, default=1)
+parser.add_argument('--sigma_min', type=float, default=0.0001)
 parser.add_argument('--rho', type=float, default=7.0)
 opt = parser.parse_args()
 
@@ -90,6 +87,8 @@ def main():
         noise = torch.randn_like(x_start)
         x_t = model.get_ddbm_sample(x_0=x_start, x_T=x_T, noise=noise, sigmas=sigma)
         im = 0.5*(x_t + 1).cpu().permute(1,2,0).data.numpy()
+        print(">>", np.max(im))
+        im = np.clip(im, 0.0, 1.0)
         print(">", sigma)
         plt.imshow(im)
         plt.savefig("plots/noise-step-{:2f}.png".format(i/n))

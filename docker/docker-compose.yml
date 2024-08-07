@@ -16,7 +16,7 @@ services:
     volumes:
       - ${PWD}/../:/root/workspace
       - /tmp/.x11-unix:/tmp/.x11-unix
-      - ${PWD}/../../datasets/maps/:/root/workspace/datas
+      - /share4/sodoo/maps:/root/workspace/datas
     environment:
       - QT_X11_NO_MITSHM=1
       - WANDB_API_KEY=${WANDB_API_KEY}
