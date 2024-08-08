@@ -406,7 +406,7 @@ def configure(dir=None, format_strs=None, comm=None, log_suffix=""):
     if dir is None:
         dir = osp.join(
             tempfile.gettempdir(),
-            datetime.datetime.now().strftime("openai-%Y-%m-%d-%H-%M-%S-%f"),
+            datetime.datetime.now().strftime("ddbm-%Y-%m-%d-%H-%M-%S-%f"),
         )
     assert isinstance(dir, str)
     dir = os.path.expanduser(dir)

@@ -80,7 +80,8 @@ def main():
     plt.savefig("plots/sample.png")
     
     n = 20
-    sigmas = model.get_sigmas(n) # sigma_max to sigma_min
+    # sigmas = model.get_sigmas(n) # sigma_max to sigma_min
+    sigmas = model.get_sigmas_bridge(n) # sigma_max to sigma_min
     x_start = sample[0].to(device)
     x_T = sample[1].to(device)
     for i, sigma in enumerate(sigmas):
