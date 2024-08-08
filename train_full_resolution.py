@@ -265,7 +265,8 @@ def train(rank, world_size, run):
                     loss_cpu = loss.item()
                     epoch_loss.append(loss_cpu)
                     tepoch.set_postfix(loss=loss_cpu)
-                run.log({"train-loss": np.mean(epoch_loss)})
+                if rank == 0:
+                    run.log({"train-loss": np.mean(epoch_loss)})
                 tglobal.set_postfix(loss=np.mean(epoch_loss))   
             
                 if (epoch_idx + 1) % opt.save_per_epoch == 0 and rank == 0:
