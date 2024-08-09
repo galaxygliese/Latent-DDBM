@@ -1,6 +1,6 @@
 #-*- coding:utf-8 -*-
 
-from diffusion import create_model, DdbmEdmDenoiser
+from diffusion import create_model, create_unet_model, DdbmEdmDenoiser
 from dataset import FolderDataset, FolderPairDataset, expand2square
 from diffusers.optimization import get_scheduler
 from diffusers.models import AutoencoderKL
@@ -19,13 +19,13 @@ parser = argparse.ArgumentParser()
 
 # General options
 parser.add_argument('--diffusion_timesteps', type=int, default=40) # Different from training
-parser.add_argument('--lr', type=float, default=1e-4)
 parser.add_argument('--warmup_steps', type=int, default=50)
 parser.add_argument('--num_channels', type=int, default=64)
-parser.add_argument('--num_res_blocks', type=int, default=1)
+parser.add_argument('--num_res_blocks', type=int, default=3)
 parser.add_argument('-d', '--device', type=int, default=0)
 parser.add_argument('-w', '--weight_path', type=str, default="./checkpoints/")
 parser.add_argument('--sample_num', type=int, default=4)
+parser.add_argument('--half', action='store_true')
 
 # Dataset options
 parser.add_argument('--dataset_path', type=str, default="./datas/val")
@@ -60,7 +60,7 @@ def generate(
         
         imgs = nimage.detach().to('cpu')
         imgs = 0.5*(imgs+1)
-        print(">>", torch.max(imgs), torch.min(imgs))
+        print(">", torch.max(imgs), torch.min(imgs))
         imgs = (imgs*255).clip(0, 255)
         
         img = make_grid(imgs)
@@ -70,12 +70,16 @@ def generate(
     img.save(export_name)
 
 def main():
-    unet = create_model(
+    attention_type = 'flash' if opt.half else 'vanilla' 
+    unet = create_unet_model(
         image_size=opt.image_size,
         num_channels=opt.num_channels,
         num_res_blocks=opt.num_res_blocks,
         in_channels=opt.in_channels,
+        use_fp16=opt.half,
+        attention_type=attention_type
     ).to(device)
+    unet.load_state_dict(torch.load(opt.weight_path))
     model = DdbmEdmDenoiser(
         unet=unet,
         sigma_data=opt.sigma_data,
@@ -84,7 +88,6 @@ def main():
         rho=opt.rho,
         device=device,
     )
-    model.load_state_dict(torch.load(opt.weight_path))
     model.eval()
     print("Model Loaded!")
     

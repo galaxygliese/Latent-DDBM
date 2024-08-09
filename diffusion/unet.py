@@ -946,7 +946,7 @@ def create_unet_model(
     use_fp16=False,
     use_new_attention_order=False,
     attention_type='flash',
-    condition_mode=None,
+    condition_mode='concat',
 ):
     if channel_mult == "":
         if image_size == 512:
