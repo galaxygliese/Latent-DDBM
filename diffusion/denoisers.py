@@ -174,7 +174,7 @@ class DdbmEdmDenoiser(nn.Module):
         
     def get_condition_weight(self, sigmas:torch.Tensor): # = a_t
         if self.sde_type == SDEType.VE:
-            return sigmas**2 / self.sigma_max**2
+            return (sigmas / self.sigma_max)**2
         elif self.sde_type == SDEType.VP:
             logsnr_t = vp_logsnr(sigmas, self.beta_d, self.beta_min)
             logsnr_T = vp_logsnr(self.sigma_max, self.beta_d, self.beta_min)
@@ -186,7 +186,7 @@ class DdbmEdmDenoiser(nn.Module):
     
     def get_sample_weight(self, sigmas:torch.Tensor): # = b_t
         if self.sde_type == SDEType.VE:
-            return 1 - sigmas**2 / self.sigma_max**2
+            return 1 - (sigmas / self.sigma_max)**2
         elif self.sde_type == SDEType.VP:
             logsnr_t = vp_logsnr(sigmas, self.beta_d, self.beta_min)
             logsnr_T = vp_logsnr(self.sigma_max, self.beta_d, self.beta_min)
@@ -222,7 +222,7 @@ class DdbmEdmDenoiser(nn.Module):
         c_in, c_skip, c_out = [
             append_dims(c, x_t.ndim) for c in self.get_ddbm_scalings(sigmas)
         ]
-        c_noises = 1000 * sigmas.log() / 4
+        c_noises = 1000 * 0.25 * torch.log(sigmas + 1e-44)
         # c_noises = sigmas.log() / 4
         if isinstance(self.unet, DDP):
             F = self.unet.module(x=c_in * x_t, timesteps=c_noises, xT=x_T)
@@ -235,14 +235,16 @@ class DdbmEdmDenoiser(nn.Module):
         sigmas = append_dims(sigmas, x_0.ndim)
         a_t = self.get_condition_weight(sigmas)
         b_t = self.get_sample_weight(sigmas)
-        mu_t = a_t * x_T + b_t * x_0 
         if self.sde_type == SDEType.VE:
-            std_t = sigmas * torch.sqrt(b_t)
+            std_t = sigmas * torch.sqrt(1 - sigmas**2 / self.sigma_max**2)
+            mu_t= sigmas**2 / self.sigma_max**2 * x_T + (1 - sigmas**2 / self.sigma_max**2) * x_0
+            # std_t = sigmas * torch.sqrt(b_t)
         elif self.sde_type == SDEType.VP:
             logsnr_t = vp_logsnr(sigmas, self.beta_d, self.beta_min)
             logsnr_T = vp_logsnr(self.sigma_max, self.beta_d, self.beta_min)
             logs_t = vp_logs(sigmas, self.beta_d, self.beta_min)
             std_t = (-torch.expm1(logsnr_T - logsnr_t)).sqrt() * (logs_t - logsnr_t/2).exp()
+            mu_t = a_t * x_T + b_t * x_0 
         else:
             raise NotImplementedError
         x_t = mu_t + std_t * noise
@@ -281,9 +283,9 @@ class DdbmEdmDenoiser(nn.Module):
     
     def get_dxdt(self, x_t:torch.Tensor, sigma_t:torch.Tensor, denoised_t:torch.Tensor, x_T:torch.Tensor, stochastic:bool=False, w:float=1):
         if self.sde_type == SDEType.VE:
-            grad_pxtlx0 = (denoised_t - x_t) / append_dims(sigma_t**2, x_t.ndim)
+            grad_pxtlx0 = (denoised_t - x_t) / append_dims(sigma_t**2, x_t.ndim) # score function
             # print("grad_pxtlx0>>", torch.max(grad_pxtlx0))
-            grad_pxTlxt = (x_T - x_t) / (append_dims(torch.ones_like(sigma_t)*self.sigma_max**2, x_t.ndim) - append_dims(sigma_t**2, x_t.ndim))
+            grad_pxTlxt = (x_T - x_t) / (append_dims(torch.ones_like(sigma_t)*self.sigma_max**2, x_t.ndim) - append_dims(sigma_t**2, x_t.ndim)) # Doobs-h
             # print("grad_pxTlxt>>", torch.max(grad_pxTlxt), stochastic)
             gt2 = 2*sigma_t
             
@@ -291,7 +293,7 @@ class DdbmEdmDenoiser(nn.Module):
                 dxdt = - gt2 * grad_pxtlx0
             else:
                 dxdt = - 0.5 * gt2 * (grad_pxtlx0 - w * grad_pxTlxt)
-            return dxdt
+            return dxdt, gt2
         elif self.sde_type == SDEType.VP:
             """Converts a denoiser output to a Karras ODE derivative."""
             a_t = self.get_condition_weight(sigma_t)
@@ -329,7 +331,7 @@ class DdbmEdmDenoiser(nn.Module):
             # grad_pxTlxt = (x_T - x_t) / (append_dims(torch.ones_like(sigma_t)*self.sigma_max**2, x_t.ndim) - append_dims(sigma_t**2, x_t.ndim))
             # gt2 = 2*sigma_t
             # dxdt = - (0.5 if not stochastic else 1) * gt2 * (grad_pxtlx0 - w * grad_pxTlxt * (0 if stochastic else 1))
-            return dxdt 
+            return dxdt, gt2
         else:
             raise NotImplementedError
     
@@ -343,19 +345,26 @@ class DdbmEdmDenoiser(nn.Module):
         indices = range(len(sigmas) - 1)
         for i, index in enumerate(indices):
             sigma_t = sigmas[index].unsqueeze(0)
-            # sigma_hat = ((sigmas[index+1] - sigmas[index]) * step_ratio + sigmas[index]).unsqueeze(0)
+            sigma_hat = ((sigmas[index+1] - sigmas[index]) * step_ratio + sigmas[index]).unsqueeze(0)
             D = self.get_denoised(x, sigma_t, x_T).clamp(-1, 1)
             # print("D>", torch.max(D), torch.min(D))
-            dxdt = self.get_dxdt(x, sigma_t, D, x_T, stochastic=True)
+            dxdt, gt2 = self.get_dxdt(x, sigma_t, D, x_T, stochastic=True)
             # print("dxdt>", torch.max(dxdt), torch.min(dxdt))
-            dt = sigmas[index + 1].unsqueeze(0) - sigma_t
+            # dt = sigmas[index + 1].unsqueeze(0) - sigma_t
+            dt = sigma_hat - sigma_t
+                
+            x = x + dxdt * dt + torch.randn_like(x) * ((dt).abs() ** 0.5)*gt2.sqrt() # x_hat
+            
+            D_hat = self.get_denoised(x, sigma_hat, x_T).clamp(-1, 1)
+            dxdt_hat, gt2_hat = self.get_dxdt(x, sigma_hat, D_hat, x_T, stochastic=False)
+            dt_hat = sigmas[i + 1] - sigma_hat
             if sigmas[index + 1] == 0:
-                x = x + dxdt * dt
+                x = x + dxdt_hat * dt_hat
             else:
-                x_heun = x + dxdt * dt 
+                x_heun = x + dxdt_hat * dt_hat
                 sigma_heun = sigmas[index + 1].unsqueeze(0)
                 D_heun = self.get_denoised(x_heun, sigma_heun, x_T).clamp(-1, 1)
-                dxdt_heun = self.get_dxdt(x_heun, sigma_heun, D_heun, x_T)
-                x = x + (dxdt + dxdt_heun) / 2 * dt
+                dxdt_heun, gt2_hat = self.get_dxdt(x_heun, sigma_heun, D_heun, x_T, stochastic=False)
+                x = x + (dxdt_hat + dxdt_heun) / 2 * dt_hat
         return x.clamp(-1, 1)
         

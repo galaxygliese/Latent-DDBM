@@ -37,8 +37,8 @@ parser.add_argument('--out_channels', type=int, default=3)
 parser.add_argument('--sigma_data', type=float, default=0.5)
 parser.add_argument('--sigma_sample_density_mean', type=float, default=-1.2)
 parser.add_argument('--sigma_sample_density_std', type=float, default=1.2)
-parser.add_argument('--sigma_max', type=float, default=1)
-parser.add_argument('--sigma_min', type=float, default=0.0001)
+parser.add_argument('--sigma_max', type=float, default=80)
+parser.add_argument('--sigma_min', type=float, default=0.002)
 parser.add_argument('--rho', type=float, default=7.0)
 opt = parser.parse_args()
 
@@ -57,6 +57,7 @@ def generate(
     with torch.no_grad():
         # initialize action from Guassian noise
         nimage = model.sample(y, steps=num_diffusion_iters)
+        # nimage = y
         
         imgs = nimage.detach().to('cpu')
         imgs = 0.5*(imgs+1)
