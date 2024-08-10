@@ -44,6 +44,15 @@ opt = parser.parse_args()
 
 device = opt.device
 
+def tensor2image(x:torch.Tensor, i:int):
+    x = ((x + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+    imgs = x.detach().to('cpu')
+        
+    img = make_grid(imgs)
+    img = T.functional.to_pil_image(img)
+    img.save(f"./plots/path/sample-{i}.jpg")
+    return img
+
 @torch.no_grad()
 def generate(
         model:DdbmEdmDenoiser, 
@@ -56,13 +65,12 @@ def generate(
     # B = sample_num
     with torch.no_grad():
         # initialize action from Guassian noise
-        nimage = model.sample(y, steps=num_diffusion_iters)
-        # nimage = y
+        nimage, path = model.sample(y, steps=num_diffusion_iters)
+        for i, x in enumerate(path):
+            tensor2image(x, i)
         
+        nimage = ((nimage + 1) * 127.5).clamp(0, 255).to(torch.uint8)
         imgs = nimage.detach().to('cpu')
-        imgs = 0.5*(imgs+1)
-        print(">", torch.max(imgs), torch.min(imgs))
-        imgs = (imgs*255).clip(0, 255)
         
         img = make_grid(imgs)
         img = transforms.functional.to_pil_image(img)
@@ -78,7 +86,11 @@ def main():
         num_res_blocks=opt.num_res_blocks,
         in_channels=opt.in_channels,
         use_fp16=opt.half,
-        attention_type=attention_type
+        attention_type=attention_type,
+        # num_heads=4,
+        # num_head_channels=64,
+        # attention_resolutions='32,16,8',
+        # resblock_updown=True,
     ).to(device)
     unet.load_state_dict(torch.load(opt.weight_path))
     model = DdbmEdmDenoiser(

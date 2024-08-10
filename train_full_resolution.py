@@ -85,11 +85,10 @@ def generate(
     # B = sample_num
     with torch.no_grad():
         # initialize action from Guassian noise
-        nimage = model.sample(y, steps=num_diffusion_iters)
+        nimage, path = model.sample(y, steps=num_diffusion_iters)
         
+        nimage = ((nimage + 1) * 127.5).clamp(0, 255).to(torch.uint8)
         imgs = nimage.detach().to('cpu')
-        imgs = 0.5*(imgs+1)
-        imgs = (imgs*255).clip(0, 255)
         
         img = make_grid(imgs)
         img = transforms.functional.to_pil_image(img)
