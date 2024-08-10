@@ -1,18 +1,40 @@
 # Latent-DDBM
 
-Simplified implementation of DDBM.
+Simplified implementation of DDBM. 
 
-### Train VP models
+Original Repogitory : [github](https://github.com/alexzhou907/DDBM)
+
+### VE models
+
+training code:
 
 ```
 python3 train_full_resolution.py --dataset_path /path/to/datas -e 500 -b 16 --save-per-epoch 50 --sigma_max 1 --sigma_min 0
 ```
 
-### Train VE models
+sampling code:
 
-:construction: [WIP] unstable.
+```
+python3 sample.py --weight_path /path/to/weight_file --dataset_path /path/to/test_datas
+```
 
-Appropriate hyperparameters should be chosen.
+input `x_T`:
+
+<image src="./assets/sample-0.jpg" />
+
+generated result `x_0` (epoch=1500):
+
+<image src="./assets/sample-80.jpg" />
+
+
+### VP models
+
+:construction: [WIP] (not debugged).
+
+
+### Latent models
+
+:construction: [WIP] (developing).
 
 # Citations
 
