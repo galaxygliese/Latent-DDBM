@@ -43,12 +43,6 @@ RUN apt-get update && apt-get install -y \
     libglu1-mesa-dev \
     x11-apps
 
-# robomimic dependencies ----------------
-RUN apt-get update && apt-get install -y \
-    libosmesa6-dev \
-    libgl1-mesa-glx \
-    libglfw3 \
-    patchelf
 
 COPY conda_environment.yaml /root/
 
